@@ -18,6 +18,33 @@ enum SharedContainerStore {
             .appendingPathComponent("ShareExtension", isDirectory: true)
     }
 
+    /// [T-sideload-appgroup-fallback] App Group container with a LOCAL fallback.
+    ///
+    /// `containerURL(forSecurityApplicationGroupIdentifier:)` returns nil when
+    /// the app's signature does not carry the group entitlement — exactly the
+    /// situation for a re-signed (sideloaded) build, because the signing
+    /// profile cannot authorize `group.com.openminis.app`. Three call sites in
+    /// the launch path force-unwrapped that result and crashed on the first
+    /// view update (migrateSharedDirToAppGroup, `minisAppGroupRoot`,
+    /// `minisConfigRoot`).
+    ///
+    /// Falling back to a private Library directory keeps the app fully usable
+    /// in single-process mode. At runtime the container is only needed for
+    /// cross-process sharing (FileProvider extension) and for stable paths
+    /// across reinstalls — nothing *requires* the path to live inside the
+    /// group container, so every consumer keeps working against the fallback.
+    /// When the entitlement IS present (normal developer/App Store builds),
+    /// this is byte-for-byte the previous behavior.
+    static var containerURLWithFallback: URL {
+        if let url = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupID) {
+            return url
+        }
+        let lib = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first!
+        let url = lib.appendingPathComponent("MinisChat/AppGroupFallback", isDirectory: true)
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url
+    }
+
     // MARK: - Write (called by Share Extension)
 
     static func savePendingShare(_ share: PendingShare) {
