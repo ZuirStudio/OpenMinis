@@ -1162,7 +1162,14 @@ struct MinisApp: App {
     private static func migrateSharedDirToAppGroup() {
         let fm = FileManager.default
         let library = fm.urls(for: .libraryDirectory, in: .userDomainMask).first!
-        let container = fm.containerURL(forSecurityApplicationGroupIdentifier: "group.com.openminis.app")!
+        // [T-sideload-appgroup-fallback] NOT `!`: on a re-signed build the
+        // group entitlement is absent, containerURL returns nil, and this
+        // force-unwrap crashed the app on EVERY launch (root-view .onAppear
+        // calls this unconditionally). The fallback keeps the legacy-migration
+        // semantics; sources that only ever existed in a real group container
+        // simply don't exist and every migration entry is skipped by its
+        // fileExists guard.
+        let container = SharedContainerStore.containerURLWithFallback
 
         let migrations: [(source: URL, dest: URL, label: String)] = [
             // Legacy Library/MinisChat/shared → new shared
