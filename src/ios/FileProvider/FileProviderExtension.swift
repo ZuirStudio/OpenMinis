@@ -13,9 +13,15 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
 
     /// Root directory for all FileProvider-visible files in the App Group container.
     static var providerRoot: URL {
+        // [T-sideload-appgroup-fallback] NOT `!`: without the group entitlement
+        // (re-signed builds) this crashed the extension on EVERY launch and
+        // fileproviderd relaunched it in a loop. Fall back to a private Library
+        // directory — cross-process sharing is impossible without the group
+        // anyway, but the extension itself stays alive and serves local content.
         let container = FileManager.default.containerURL(
             forSecurityApplicationGroupIdentifier: "group.com.openminis.app"
-        )!
+        ) ?? FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first!
+            .appendingPathComponent("MinisChat/AppGroupFallback", isDirectory: true)
         let url = container.appendingPathComponent("MinisFileProvider", isDirectory: true)
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
