@@ -6044,7 +6044,19 @@ extension RawMessage {
                         agentParts.append(.text(PastePlaceholder.unavailableMarker))
                     }
                 } else if let data = try? Data(contentsOf: mediaResolver(ref)) {
-                    agentParts.append(.imageData(data: data, mimeType: ref.mimeType, linuxPath: ref.linuxPath))
+                    // [T-replay-image-clamp / GH#412] Defense-in-depth for history
+                    // replay. Oversized images already sitting in the media store
+                    // (e.g. full_page browser screenshots persisted before the
+                    // producer-side clamp existed) used to be re-sent verbatim,
+                    // so the provider 400'd EVERY subsequent request — the
+                    // session looked permanently bricked after a restart. Clamp
+                    // when possible; otherwise keep the exact old behavior so
+                    // non-image media (audio, corrupt files) is untouched.
+                    if let clamped = Self.replayClampedImage(data) {
+                        agentParts.append(.imageData(data: clamped, mimeType: Self.sniffImageMimeType(clamped) ?? "image/jpeg", linuxPath: ref.linuxPath))
+                    } else {
+                        agentParts.append(.imageData(data: data, mimeType: ref.mimeType, linuxPath: ref.linuxPath))
+                    }
                 }
             case .toolUse(let tu):
                 let input = parseJSONToDict(tu.input)
@@ -6055,9 +6067,13 @@ extension RawMessage {
                 if let ref = tr.mediaRef {
                     let fileURL = mediaResolver(ref)
                     if let data = try? Data(contentsOf: fileURL) {
-                        imgData = data
+                        // [T-replay-image-clamp / GH#412] Same clamp as the
+                        // mediaRef case above — this is the toolResult path where
+                        // the full_page screenshots live.
+                        let clamped = Self.replayClampedImage(data) ?? data
+                        imgData = clamped
                         // Sniff actual image format — stored mimeType may be wrong (e.g. png for jpeg data)
-                        imgMime = Self.sniffImageMimeType(data) ?? ref.mimeType
+                        imgMime = Self.sniffImageMimeType(clamped) ?? ref.mimeType
                     }
                 }
                 agentParts.append(.toolResult(id: tr.toolUseId, name: "", content: tr.output, isError: !tr.success, imageData: imgData, imageMimeType: imgMime, imageLinuxPath: tr.mediaRef?.linuxPath))
@@ -6074,6 +6090,35 @@ extension RawMessage {
         // design (see ReasoningEcho.persistableJSON).
         msg.reasoningEcho = ReasoningEcho(persistedJSON: reasoningEchoJSON)
         return msg
+    }
+
+    /// [T-replay-image-clamp / GH#412] Downscale a history image to a
+    /// provider-safe long edge before it is re-sent on session replay.
+    ///
+    /// Providers reject whole requests over a single oversized image
+    /// (dimension caps around 8192 px, size caps around 5 MB), and before the
+    /// producer-side clamps existed a full_page browser screenshot
+    /// (1280 x 32768 px) could be persisted into the media store — every
+    /// replay then re-sent it and the session was permanently bricked behind a
+    /// [400]. This mirror of `AIChatViewModel.resizedImageData` (kept local so
+    /// ChatStore does not reach into the view-model layer) returns nil when no
+    /// clamp is needed — image missing/corrupt, non-image media, or already
+    /// within bounds — and callers then fall back to the original bytes so
+    /// behavior is unchanged for everything except the oversized case.
+    /// A returned value is always a fresh JPEG encode (quality 0.85).
+    private static func replayClampedImage(_ data: Data, maxLongEdge: CGFloat = 2000) -> Data? {
+        guard let image = UIImage(data: data), image.cgImage != nil else { return nil }
+        let pixelW = image.size.width * image.scale
+        let pixelH = image.size.height * image.scale
+        let longest = max(pixelW, pixelH)
+        guard longest > maxLongEdge else { return nil }
+        let scale = maxLongEdge / longest
+        let newSize = CGSize(width: (pixelW * scale).rounded(), height: (pixelH * scale).rounded())
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1.0
+        let renderer = UIGraphicsImageRenderer(size: newSize, format: format)
+        let resized = renderer.image { _ in image.draw(in: CGRect(origin: .zero, size: newSize)) }
+        return resized.jpegData(compressionQuality: 0.85)
     }
 
     /// Detect actual image format from file magic bytes.

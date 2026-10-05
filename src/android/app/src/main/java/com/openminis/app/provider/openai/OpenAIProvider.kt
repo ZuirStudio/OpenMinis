@@ -3323,7 +3323,16 @@ class OpenAIProvider private constructor(
         // Responses-API cache regardless of how byte-stable the prefix was —
         // that's the missing piece between Android (~70%) and iOS (90%+) on
         // the Codex OAuth / forceResponsesAPI path.
-        body.put("prompt_cache_key", derivePromptCacheKey(messages))
+        // [T-android-prompt-cache-key-400 / GH#247] Gated, mirroring iOS
+        // `OpenAIAgentProvider.shouldSendPromptCacheKey`: the earlier
+        // unconditional put assumed vendors that don't recognise the field
+        // would ignore it — false. Strict-schema gateways (NVIDIA NIM was
+        // reported three times: #247/#259/#268; self-hosted deepseek-v4 too)
+        // answer `400 UNKNOWN_FIELD: 未知请求字段：prompt_cache_key` and fail
+        // the WHOLE request, so the default must be "don't send".
+        if (shouldSendPromptCacheKey()) {
+            body.put("prompt_cache_key", derivePromptCacheKey(messages))
+        }
         // T-responses-include: `include: ["reasoning.encrypted_content"]` is a
         // ChatGPT-backend-only field. Third-party Responses-API-compatible
         // proxies (non-OpenAI) don't recognize it and reject the request with
@@ -3845,6 +3854,32 @@ class OpenAIProvider private constructor(
             }
         }
         return "minis-${java.util.UUID.randomUUID().toString().lowercase()}"
+    }
+
+    /**
+     * [T-android-prompt-cache-key-400 / GH#247] Whether this provider may
+     * receive the `prompt_cache_key` request field. Allowlist, not blanket —
+     * the field is a pure cache-locality hint with no behavioural meaning, so
+     * omitting it only weakens the cache hit rate, while sending it to a
+     * strict-schema vendor fails the whole request with 400 UNKNOWN_FIELD.
+     *
+     * Mirrors iOS `OpenAIAgentProvider.shouldSendPromptCacheKey(for:)`:
+     *   • Codex OAuth (chatgpt.com backend) — the vendor that defined the field;
+     *   • `useResponsesAPI` — an explicit user opt-in declaring the base
+     *     speaks the Responses API (sub2api-style relays need the key, see
+     *     Wei-Shaw/sub2api#1134), so opting in asserts compatibility;
+     *   • the official api.openai.com base (default basePath, no custom base);
+     *   • never Azure (its Responses surface differs and the field was never
+     *     part of the Azure contract).
+     * Everyone else — plain custom-base OpenAI-compatible endpoints like
+     * NVIDIA NIM — gets the field omitted.
+     */
+    private fun shouldSendPromptCacheKey(): Boolean {
+        if (isOAuth) return true
+        if (isAzure) return false
+        if (useResponsesAPI) return true
+        val host = basePath.toHttpUrlOrNull()?.host ?: return false
+        return host == "api.openai.com" || host.endsWith(".openai.com")
     }
 
     /**

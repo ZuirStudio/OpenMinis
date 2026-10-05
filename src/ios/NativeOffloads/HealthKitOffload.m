@@ -269,15 +269,23 @@ static NSOperationQueue *authQueue(void) {
 // exception → SIGABRT on iOS 26.5). The structurally read-only classes are
 // HKCharacteristicType (biological sex, blood type, DOB, …) and
 // HKActivitySummaryType (the activity rings) — these can only ever be read.
-// Any further per-version restriction is still backstopped by the @try/@catch
-// around the request call. Returns nil if nothing remains shareable.
+// [T-healthkit-correlation-share-auth / GH#393] HKCorrelationType belongs in
+// the same drop list: HealthKit refuses share-authorization for correlation
+// types outright — write access piggybacks on the constituent quantity types
+// (for blood pressure: BloodPressureSystolic + BloodPressureDiastolic).
+// Keeping the correlation in the share set poisoned the WHOLE request, so
+// `log-blood-pressure` answered authorization_denied even when the user
+// granted both constituents. Any further per-version restriction is still
+// backstopped by the @try/@catch around the request call. Returns nil if
+// nothing remains shareable.
 static NSSet<HKSampleType *> *sanitizeShareTypes(NSSet<HKSampleType *> *shareTypes) {
     if (shareTypes.count == 0) return shareTypes;
     NSMutableSet<HKSampleType *> *filtered = [NSMutableSet setWithCapacity:shareTypes.count];
     for (HKSampleType *t in shareTypes) {
         if ([t isKindOfClass:[HKCharacteristicType class]] ||
-            [t isKindOfClass:[HKActivitySummaryType class]]) {
-            NSLog(@"[healthkit/auth] dropping non-shareable (read-only) type from shareTypes: %@",
+            [t isKindOfClass:[HKActivitySummaryType class]] ||
+            [t isKindOfClass:[HKCorrelationType class]]) {
+            NSLog(@"[healthkit/auth] dropping non-shareable (read-only / correlation) type from shareTypes: %@",
                   t.identifier);
             continue;
         }
@@ -2805,9 +2813,15 @@ static int cmd_log_blood_pressure(int argc, char **argv, int stdout_fd, BOOL com
     HKQuantityType *diaType = [HKQuantityType quantityTypeForIdentifier:HKQuantityTypeIdentifierBloodPressureDiastolic];
     HKCorrelationType *bpType = [HKCorrelationType correlationTypeForIdentifier:HKCorrelationTypeIdentifierBloodPressure];
 
-    // Request authorization for all three types in one prompt. Correlation
-    // share-auth piggybacks on the constituent quantity types.
-    NSSet *writeTypes = [NSSet setWithObjects:sysType, diaType, bpType, nil];
+    // Request authorization for the CONSTITUENT quantity types only.
+    // [T-healthkit-correlation-share-auth / GH#393] The correlation type must
+    // NOT go into the share set: HealthKit disallows share-authorization for
+    // HKCorrelationType (write access piggybacks on the constituents), and
+    // including it made the whole request answer authorization_denied —
+    // log-blood-pressure failed deterministically even after the user granted
+    // both quantities. sanitizeShareTypes now also backstops this, but the
+    // call site states the correct set directly.
+    NSSet *writeTypes = [NSSet setWithObjects:sysType, diaType, nil];
     NSString *authErr = nil;
     if (!requestHealthKitAccess(writeTypes, writeTypes, &authErr)) {
         noff_emit_json(stdout_fd, noff_json_error(TOOL_NAME, @"log-blood-pressure",

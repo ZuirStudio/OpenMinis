@@ -1011,8 +1011,18 @@ extension AIChatViewModel {
         case "browser_use":
             if let imagePath = (msgIdx < messages.count && blockIdx < messages[msgIdx].blocks.count)
                 ? messages[msgIdx].blocks[blockIdx].imageFilePath : nil,
-               let imageData = try? Data(contentsOf: URL(fileURLWithPath: imagePath)),
+               let rawImageData = try? Data(contentsOf: URL(fileURLWithPath: imagePath)),
                let sid = sessionId {
+                // [T-browser-fullpage-brick / GH#412] The screenshot file is the
+                // ORIGINAL capture — a full_page snapshot can be 1280 x 32768 px,
+                // far past every provider's image limit (8192 px / ~5 MB). Save
+                // those bytes into the session mediaRef and every later replay
+                // re-sends the oversized image, so the provider 400s the whole
+                // request and the session is permanently bricked after a
+                // restart. Clamp to the same 2000 px long edge the live-turn
+                // path already uses. resizedImageData returns nil when the image
+                // is already within bounds, so the ?? fallback is a no-op there.
+                let imageData = Self.resizedImageData(rawImageData, maxLongEdge: 2000) ?? rawImageData
                 let ref = await ChatStore.shared.saveMedia(
                     data: imageData, mimeType: "image/jpeg", sessionId: sid,
                     originalFileName: "browser_snapshot.jpg", subdir: "browser",
@@ -1027,9 +1037,17 @@ extension AIChatViewModel {
         case "read_image":
             if let imagePath = (msgIdx < messages.count && blockIdx < messages[msgIdx].blocks.count)
                 ? messages[msgIdx].blocks[blockIdx].imageFilePath : nil,
-               let imageData = try? Data(contentsOf: URL(fileURLWithPath: imagePath)),
+               let rawImageData = try? Data(contentsOf: URL(fileURLWithPath: imagePath)),
                let sid = sessionId {
                 let fileURL = URL(fileURLWithPath: imagePath)
+                // [T-browser-fullpage-brick / GH#412] read_image can be pointed
+                // at arbitrary user files (scans, exported charts, camera RAW
+                // exports) whose long edge routinely exceeds provider limits.
+                // Clamp before persisting, mirroring the browser_use case —
+                // otherwise a single oversized read_image bricks the session on
+                // replay exactly like a full_page screenshot. Detect the mime
+                // AFTER clamping: the clamped re-encode is always JPEG.
+                let imageData = Self.resizedImageData(rawImageData, maxLongEdge: 2000) ?? rawImageData
                 let mime = Self.detectImageMime(imageData)
                 let ref = await ChatStore.shared.saveMedia(
                     data: imageData, mimeType: mime, sessionId: sid,

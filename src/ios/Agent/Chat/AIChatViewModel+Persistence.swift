@@ -2176,27 +2176,70 @@ extension AIChatViewModel {
             let postAnchorTags = postAnchor.enumerated().map { (off, m) -> String in
                 "\(anchorIdx + 1 + off):\(m.role.rawValue)"
             }
-            logger.verbose("[CompactDiag] eAH v2 layout: preAnchorSent=[\(preAnchorTags.joined(separator: ","))] | SUMMARY injected into first postAnchor user | postAnchorAbsIdx=[\(postAnchorTags.joined(separator: ","))]")
+            logger.verbose("[CompactDiag] eAH v2 layout: preAnchorSent=[\(preAnchorTags.joined(separator: ","))] | SUMMARY injected at safe boundary | postAnchorAbsIdx=[\(postAnchorTags.joined(separator: ","))]")
 
-            if let firstUserOffset = postAnchor.firstIndex(where: { $0.role == .user }) {
-                // Splice: copy prefix as-is, mutate the first user, copy rest.
-                if firstUserOffset > 0 {
-                    result.append(contentsOf: postAnchor[0..<firstUserOffset])
+            // [T-compact-summary-safe-boundary / GH#404] The summary MUST be
+            // injected at a tool-use/tool-result SAFE boundary. Inserting it
+            // into the first post-anchor user message blindly can split a
+            // tool_use (assistant) from its matching tool_result (user), which
+            // Claude's API rejects with:
+            //   `tool_use` ids were found without `tool_result` blocks immediately after
+            //
+            // Safe boundary definition:
+            //   • Either: at a user message that STARTS a new conversation turn
+            //     (i.e., the preceding message is assistant AND has NO unmatched tool_use)
+            //   • Or: after the last message of a complete tool-use/tool-result round
+            //   • Never: between a tool_use and its tool_result
+            //
+            // Strategy: scan postAnchor from the start, tracking open tool_use ids.
+            // The first user message where openToolUseIds.isEmpty is a safe injection point.
+            // If none exists (entire postAnchor is mid-tool-round), fall back to
+            // appending summary as a standalone user message at the END of postAnchor
+            // (which preserves pairing because the open tool_use will get its
+            // tool_result in the NEXT turn, after the summary).
+
+            var openToolUseIds: Set<String> = []
+            var safeInjectionOffset: Int? = nil
+
+            for (offset, msg) in postAnchor.enumerated() {
+                // First, check if THIS message is a safe injection point
+                // (before processing its parts). A user message is safe if no
+                // tool_use is currently open.
+                if msg.role == .user && openToolUseIds.isEmpty {
+                    safeInjectionOffset = offset
+                    break
                 }
-                var injected = postAnchor[firstUserOffset]
+
+                // Then update openToolUseIds based on this message's parts
+                for part in msg.parts {
+                    switch part {
+                    case .toolUse(let id, _, _, _):
+                        openToolUseIds.insert(Self.pairingKey(id))
+                    case .toolResult(let id, _, _, _, _, _, _, _, _):
+                        openToolUseIds.remove(Self.pairingKey(id))
+                    default:
+                        break
+                    }
+                }
+            }
+
+            if let injOffset = safeInjectionOffset {
+                // Inject summary into the safe user message
+                if injOffset > 0 {
+                    result.append(contentsOf: postAnchor[0..<injOffset])
+                }
+                var injected = postAnchor[injOffset]
                 injected.parts.insert(.text(summaryText), at: 0)
                 result.append(injected)
-                if firstUserOffset + 1 < postAnchor.count {
-                    result.append(contentsOf: postAnchor[(firstUserOffset + 1)...])
+                if injOffset + 1 < postAnchor.count {
+                    result.append(contentsOf: postAnchor[(injOffset + 1)...])
                 }
             } else {
-                // No user message after anchor — append everything, then a
-                // standalone summary user turn at the end. The new user input
-                // about to be added by the caller will follow it as the last
-                // user, but two user turns at the tail will be merged by the
-                // existing mergeConsecutiveSameRole pass downstream. (Rare:
-                // only happens when compact ran but no new user prompt exists
-                // yet.)
+                // No safe boundary found — entire postAnchor is inside a tool round.
+                // Append everything, then add summary as a standalone user turn
+                // at the END. This preserves pairing because the open tool_use(s)
+                // will receive their tool_result in the next model turn (after
+                // this summary message).
                 result.append(contentsOf: postAnchor)
                 result.append(AgentMessage(role: .user, parts: [.text(summaryText)]))
             }
