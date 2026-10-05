@@ -1,10 +1,8 @@
 name: Build unsigned iOS IPA
 
 # 用法（在自己 fork 的仓库里）：
-#   1. 把补丁应用到分支并提交：
-#        for p in patches/412_*.patch patches/393_*.patch; do patch -p1 < "$p"; done
-#        git add -A && git commit -m "Apply fix patches (GH#412, GH#393)"
-#   2. 把本文件放到 .github/workflows/build-ipa.yml 并提交
+#   1. 把补丁应用到分支并提交
+#   2. 本文件放到 .github/workflows/build-ipa.yml 并提交
 #   3. 仓库 Actions 页 → "Build unsigned iOS IPA" → Run workflow
 #   4. 跑完（约 60–90 分钟，首次含原生依赖编译）在 Summary 下载 artifact
 #   5. 未签名 IPA 不能直接安装：用 ESign / AltStore / Sideloadly 签名后侧载
@@ -15,24 +13,36 @@ on:
 
 jobs:
   build:
-    runs-on: macos-15
-    timeout-minutes: 150
+    # macOS 26 (arm64) — 默认 Xcode 26.6，含 iOS 26.x SDK（macos-15 默认 Xcode 16.4，太老）
+    runs-on: macos-26
+    timeout-minutes: 180
     steps:
       - name: Checkout (with submodules)
         uses: actions/checkout@v4
         with:
           submodules: recursive
 
+      - name: Toolchain check (fast fail)
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version || true
+          echo "── schemes ──"
+          xcodebuild -list -project src/ios/Minis.xcodeproj | head -40
+
       - name: Install toolchain
         run: |
           brew install ninja llvm libarchive pkg-config go
           brew install meson || pip3 install meson
+          # Homebrew LLVM 是 keg-only：把 ld.lld 放进 PATH，iSH VDSO 构建要用 -fuse-ld=lld
+          echo "/opt/homebrew/opt/llvm/bin" >> "$GITHUB_PATH"
+          sudo ln -sf /opt/homebrew/opt/llvm/bin/ld.lld /usr/local/bin/ld.lld || true
+          ls -la /opt/homebrew/opt/llvm/bin/ | grep -E "ld\.lld|lld" | head -5 || true
           go version
 
       - name: Metal toolchain (FFmpeg videotoolbox filters)
-        run: sudo xcodebuild -downloadComponent MetalToolchain || echo "metal toolchain download failed; continuing"
+        run: sudo xcodebuild -downloadComponent MetalToolchain || echo "metal toolchain skipped; continuing"
 
-      # 原生依赖很贵（30–60 分钟），用 actions/cache 按 scripts 内容缓存
+      # 原生依赖很贵（30–60 分钟）：稳定 key + save-always（失败也保存，重试秒过）
       - name: Cache native deps
         uses: actions/cache@v4
         with:
@@ -42,11 +52,14 @@ jobs:
             deps/libs
             deps/include
             deps/resources
-          key: ios-native-deps-${{ hashFiles('deps/build_*.sh', 'deps/prepare_alpine_rootfs.sh') }}-${{ github.sha }}
-          restore-keys: ios-native-deps-${{ hashFiles('deps/build_*.sh', 'deps/prepare_alpine_rootfs.sh') }}-
+          key: ios-native-deps-v2-${{ hashFiles('deps/build_*.sh', 'deps/prepare_alpine_rootfs.sh') }}
+          restore-keys: |
+            ios-native-deps-v2-
+          save-always: true
 
       - name: Build native dependencies
         run: |
+          export PATH="/opt/homebrew/opt/llvm/bin:$PATH"
           ./deps/build_lame.sh
           ./deps/build_ffmpeg.sh
           ./deps/build_ish.sh
@@ -63,12 +76,15 @@ jobs:
             -destination 'generic/platform=iOS' \
             -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY='' \
-            DEVELOPMENT_TEAM='' build
+            DEVELOPMENT_TEAM='' \
+            build
 
       - name: Assemble unsigned IPA
         run: |
           APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -1)
           test -n "$APP"
+          echo "App bundle: $APP"
+          du -sh "$APP" || true
           mkdir Payload
           cp -R "$APP" Payload/
           zip -qry Minis-unsigned.ipa Payload
